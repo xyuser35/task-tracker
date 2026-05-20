@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <meta name="theme-color" content="#0d1117"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="Tasks"/>
+  <title>Tasks</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0d1117;color:#7a9bb5;font-family:'JetBrains Mono','Fira Code',monospace;min-height:100vh;-webkit-font-smoothing:antialiased}
+    button{cursor:pointer;font-family:inherit}
+    input{-webkit-appearance:none;border-radius:0;font-family:inherit}
+    #root{display:flex;flex-direction:column;min-height:100vh}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js'
+import { getFirestore, doc, onSnapshot, setDoc } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js'
+import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js'
+
+// ── Firebase ──────────────────────────────────────────────────────────────────
+const app = initializeApp({
+  apiKey:            "AIzaSyCjdlCsM_njYLGb1r9r47zpoAHXbhZuxXg",
+  authDomain:        "whouser-task.firebaseapp.com",
+  projectId:         "whouser-task",
+  storageBucket:     "whouser-task.firebasestorage.app",
+  messagingSenderId: "782268030730",
+  appId:             "1:782268030730:web:c1af589b1af2c0410c64f3"
+})
+const db   = getFirestore(app)
+const auth = getAuth(app)
+
+// ── state ─────────────────────────────────────────────────────────────────────
+const FOLDERS = ['Личное','Работа']
+const PALETTE = ['#FF79C6','#FF5555','#FFB86C','#F1FA8C','#5BBFDE','#8BE9FD','#50FA7B','#BD93F9','#7EB8A4','#6272A4','#FF6E6E','#A4FFFF','#FFFFA5','#69FF94','#D6ACFF','#FF92DF']
+const DATE_COLOR = '#6ab0d4'
+const MONTHS = {'январ':'01','феврал':'02','март':'03','апрел':'04','май':'05','июн':'06','июл':'07','август':'08','сентябр':'09','октябр':'10','ноябр':'11','декабр':'12'}
+
+let STATE = {
+  tasks:{'Личное':[],'Работа':[]},
+  tags:{
+    'Личное':[{id:'l1',label:'ПА',color:'#FF79C6'},{id:'l2',label:'ОПЛАТА',color:'#FFB86C'}],
+    'Работа':[{id:'w1',label:'СОГЛАСОВАТЬ',color:'#5BBFDE'},{id:'w2',label:'ПЕРЕЗВОНИТЬ',color:'#8BE9FD'},{id:'w3',label:'ЗАПРОСИТЬ',color:'#BD93F9'}]
+  }
+}
+let folderIdx = 0
+let sidebarOpen = false
+let uid = null
+let synced = false
+let remoteUpdate = false
+
+function folder(){ return FOLDERS[folderIdx] }
+function tags(){ return STATE.tags[folder()]||[] }
+function tasks(){ return STATE.tasks[folder()]||[] }
+
+// ── text ──────────────────────────────────────────────────────────────────────
+function parseDate(s){
+  let m=s.match(/^(\d{1,2})[.\-\/](\d{1,2})$/)
+  if(m)return m[1].padStart(2,'0')+'.'+m[2].padStart(2,'0')
+  m=s.match(/^(\d{1,2})\s*([а-яёa-z]+)/i)
+  if(m){const d=m[1].padStart(2,'0'),w=m[2].toLowerCase();for(const[k,v]of Object.entries(MONTHS))if(w.startsWith(k))return d+'.'+v}
+  m=s.match(/^([а-яёa-z]+)\s*(\d{1,2})/i)
+  if(m){const w=m[1].toLowerCase(),d=m[2].padStart(2,'0');for(const[k,v]of Object.entries(MONTHS))if(w.startsWith(k))return d+'.'+v}
+  return null
+}
+
+function cook(raw, tgs){
+  let s=raw
+  for(const t of tgs) s=s.split(new RegExp(t.label,'gi')).join(t.label)
+  const dates=[]
+  s=s.replace(/\d{1,2}[.\-\/]\d{1,2}|\d{1,2}\s*[а-яё]+|[а-яё]+\s*\d{1,2}/gi,tok=>{
+    const d=parseDate(tok.trim());if(d){dates.push(d);return''}return tok
+  })
+  const found=[]
+  for(const t of tgs){if(s.includes(t.label)){found.push(t.label);s=s.split(t.label).join('')}}
+  s=s.replace(/\s+/g,' ').trim()
+  const parts=[]
+  if(found.length)parts.push(found.join(' '))
+  if(dates.length)parts.push(dates.map(d=>'§'+d+'§').join(' '))
+  if(s)parts.push(s)
+  return parts.join(' ')
+}
+
+function renderText(text, tgs){
+  if(!text)return document.createTextNode('')
+  const map={}; for(const t of tgs)map[t.label]=t.color
+  const frag=document.createDocumentFragment()
+  const parts=text.split(/(§[\d.]+§)/)
+  for(const p of parts){
+    const dm=p.match(/^§([\d.]+)§$/)
+    if(dm){const s=document.createElement('span');s.style.color=DATE_COLOR;s.textContent=dm[1];frag.appendChild(s);continue}
+    if(!tgs.length){frag.appendChild(document.createTextNode(p));continue}
+    let chunks=[p]
+    for(const t of tgs){
+      const next=[]
+      for(const c of chunks){
+        if(typeof c!=='string'){next.push(c);continue}
+        const parts2=c.split(t.label)
+        parts2.forEach((x,i)=>{
+          if(x)next.push(x)
+          if(i<parts2.length-1){const s=document.createElement('span');s.style.color=t.color;s.style.fontWeight='600';s.textContent=t.label;next.push(s)}
+        })
+      }
+      chunks=next
+    }
+    for(const c of chunks) frag.appendChild(typeof c==='string'?document.createTextNode(c):c)
+  }
+  return frag
+}
+
+function primaryTag(text,tgs){for(const t of tgs)if(text.includes(t.label))return t.label;return null}
+function sortItems(items,tgs){
+  const order=tgs.map(t=>t.label)
+  return [...items].sort((a,b)=>{
+    const ia=order.indexOf(primaryTag(a.text,tgs)??''),ib=order.indexOf(primaryTag(b.text,tgs)??'')
+    return(ia<0?999:ia)-(ib<0?999:ib)||a.id-b.id
+  })
+}
+
+// ── firebase sync ─────────────────────────────────────────────────────────────
+async function initFirebase(){
+  const user = await signInAnonymously(auth).then(r=>r.user)
+  uid = user.uid
+  const ref = doc(db,'users',uid,'data','state')
+  onSnapshot(ref, snap=>{
+    if(snap.exists()){remoteUpdate=true;STATE=snap.data();render()}
+    synced=true
+  })
+}
+
+function saveToFirebase(){
+  if(!uid||!synced)return
+  if(remoteUpdate){remoteUpdate=false;return}
+  const ref=doc(db,'users',uid,'data','state')
+  setDoc(ref,STATE).catch(console.error)
+}
+
+// ── render ────────────────────────────────────────────────────────────────────
+function el(tag,attrs={},children=[]){
+  const e=document.createElement(tag)
+  for(const[k,v]of Object.entries(attrs)){
+    if(k==='style')Object.assign(e.style,v)
+    else if(k.startsWith('on'))e.addEventListener(k.slice(2).toLowerCase(),v)
+    else e[k]=v
+  }
+  for(const c of children){if(c)e.appendChild(typeof c==='string'?document.createTextNode(c):c)}
+  return e
+}
+
+function makeTaskRow(task, tgs, done){
+  const pressTimer={t:null}
+  const row=el('div',{style:{display:'flex',alignItems:'center',gap:'9px',padding:'7px 4px',transition:'background 0.1s',userSelect:'none',cursor:'default'}})
+
+  let hovered=false
+  row.addEventListener('mouseenter',()=>{hovered=true;row.style.background='#0f1924'})
+  row.addEventListener('mouseleave',()=>{hovered=false;row.style.background='transparent';clearTimeout(pressTimer.t)})
+  row.addEventListener('mousedown',()=>{pressTimer.t=setTimeout(()=>togglePrio(task.id),500)})
+  row.addEventListener('mouseup',()=>clearTimeout(pressTimer.t))
+  row.addEventListener('touchstart',()=>{pressTimer.t=setTimeout(()=>togglePrio(task.id),500)},{passive:true})
+  row.addEventListener('touchend',()=>clearTimeout(pressTimer.t))
+  row.addEventListener('dblclick',e=>{e.stopPropagation();addSubtask(task.id,tgs,row.parentElement)})
+
+  const box=el('button',{style:{width:'12px',height:'12px',minWidth:'12px',border:`1px solid ${done?'#2a4a3a':'#1a2535'}`,borderRadius:'2px',background:'transparent',display:'flex',alignItems:'center',justifyContent:'center',padding:'0',flexShrink:'0'}})
+  if(done){const c=el('span',{style:{color:'#2a5a3a',fontSize:'9px',fontWeight:'bold',lineHeight:'1'}});c.textContent='✓';box.appendChild(c)}
+  box.addEventListener('click',e=>{clearTimeout(pressTimer.t);toggleTask(task.id)})
+
+  const txt=el('span',{style:{flex:'1',fontSize:'12px',color:'#7a9bb5',lineHeight:'1.5',wordBreak:'break-word',fontWeight:'300',textDecoration:done?'line-through':'none',opacity:done?'0.3':'1'}})
+  txt.appendChild(renderText(task.text,tgs))
+
+  const del=el('button',{style:{background:'transparent',border:'none',color:'#2a4055',fontSize:'14px',opacity:'0',padding:'2px 4px',lineHeight:'1'}})
+  del.textContent='×'
+  del.addEventListener('click',e=>{e.stopPropagation();deleteTask(task.id)})
+  row.addEventListener('mouseenter',()=>del.style.opacity='0.4')
+  row.addEventListener('mouseleave',()=>del.style.opacity='0')
+
+  row.appendChild(box);row.appendChild(txt)
+  if(task.priority&&!done){const p=el('span',{style:{color:'#5a2525',fontSize:'10px',fontWeight:'500',flexShrink:'0',letterSpacing:'0.1em'}});p.textContent='!!!';row.appendChild(p)}
+  row.appendChild(del)
+  return row
+}
+
+function makeSubRow(sub, tgs){
+  const row=el('div',{style:{display:'flex',alignItems:'center',gap:'6px',padding:'3px 4px'}})
+  let hovered=false
+  row.addEventListener('mouseenter',()=>{hovered=true;row.style.background='#0c1520';delBtn.style.opacity='0.35'})
+  row.addEventListener('mouseleave',()=>{hovered=false;row.style.background='transparent';delBtn.style.opacity='0'})
+
+  const indent=el('span',{style:{color:'#1a2535',fontSize:'11px',flexShrink:'0',width:'16px',textAlign:'center'}})
+  indent.textContent='└'
+
+  const box=el('button',{style:{width:'11px',height:'11px',minWidth:'11px',border:`1px solid ${sub.done?'#2a4a3a':'#161e2a'}`,borderRadius:'2px',background:'transparent',display:'flex',alignItems:'center',justifyContent:'center',padding:'0',flexShrink:'0'}})
+  if(sub.done){const c=el('span',{style:{color:'#2a5a3a',fontSize:'8px',fontWeight:'bold',lineHeight:'1'}});c.textContent='✓';box.appendChild(c)}
+  box.addEventListener('click',()=>toggleSub(sub.taskId,sub.id))
+
+  const txt=el('span',{style:{flex:'1',fontSize:'11px',color:'#6a8399',lineHeight:'1.5',wordBreak:'break-word',fontWeight:'300',textDecoration:sub.done?'line-through':'none',opacity:sub.done?'0.3':'0.7'}})
+  txt.appendChild(renderText(sub.text,tgs))
+
+  const delBtn=el('button',{style:{background:'transparent',border:'none',color:'#2a4055',fontSize:'13px',opacity:'0',padding:'2px 4px',lineHeight:'1'}})
+  delBtn.textContent='×'
+  delBtn.addEventListener('click',()=>deleteSub(sub.taskId,sub.id))
+
+  row.appendChild(indent);row.appendChild(box);row.appendChild(txt);row.appendChild(delBtn)
+  return row
+}
+
+function addSubtask(taskId, tgs, container){
+  const wrap=el('div',{style:{display:'flex',alignItems:'center',gap:'6px',padding:'3px 4px'}})
+  const indent=el('span',{style:{color:'#1a2535',fontSize:'11px',flexShrink:'0',width:'16px',textAlign:'center'}})
+  indent.textContent='└'
+  const inp=el('input',{style:{flex:'1',background:'transparent',border:'none',borderBottom:'1px solid #1f6feb',outline:'none',color:'#6a8399',fontSize:'11px',fontWeight:'300',padding:'0 0 2px'}})
+  wrap.appendChild(indent);wrap.appendChild(inp)
+  // insert before the delete button area
+  const doneSubRows=container.querySelectorAll('[data-donesub]')
+  const ref=doneSubRows.length?doneSubRows[0]:null
+  container.insertBefore(wrap,ref)
+  inp.focus()
+  function commit(){
+    const v=inp.value.trim()
+    if(v) addSub(taskId,cook(v,tgs))
+    wrap.remove()
+  }
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter')commit();if(e.key==='Escape')wrap.remove()})
+  inp.addEventListener('blur',()=>setTimeout(()=>wrap.remove(),150))
+}
+
+function makeSidebar(){
+  const overlay=el('div',{style:{position:'fixed',inset:'0',background:'rgba(0,0,0,0.6)',zIndex:'100',display:'flex'}})
+  const sb=el('div',{style:{width:'250px',maxWidth:'88vw',background:'#080d13',borderRight:'1px solid #0f1924',height:'100%',display:'flex',flexDirection:'column',padding:'16px 12px',boxSizing:'border-box',overflowY:'auto'}})
+
+  const head=el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'16px'}})
+  const title=el('span',{style:{color:'#2a4055',fontSize:'10px',letterSpacing:'0.14em'}});title.textContent=folder()
+  const closeBtn=el('button',{style:{background:'transparent',border:'none',color:'#2a4055',fontSize:'16px',padding:'2px 4px',lineHeight:'1'}});closeBtn.textContent='×'
+  closeBtn.addEventListener('click',closeSidebar)
+  head.appendChild(title);head.appendChild(closeBtn)
+
+  const tagList=el('div',{style:{display:'flex',flexDirection:'column',marginBottom:'16px'}})
+
+  function renderTagList(){
+    tagList.innerHTML=''
+    for(const t of tags()){
+      const block=el('div',{style:{borderBottom:'1px solid #0a1018',paddingBottom:'5px',paddingTop:'4px'}})
+      const row=el('div',{style:{display:'flex',alignItems:'center',gap:'8px'}})
+      const lbl=el('span',{style:{fontSize:'11px',fontWeight:'500',letterSpacing:'0.08em',flex:'1',color:t.color}});lbl.textContent=t.label
+      const sw=el('button',{style:{width:'9px',height:'9px',borderRadius:'50%',border:'none',background:t.color,padding:'0',flexShrink:'0',opacity:'0.8'}})
+      let palOpen=false
+      sw.addEventListener('click',()=>{palOpen=!palOpen;pal.style.display=palOpen?'flex':'none'})
+      const rem=el('button',{style:{background:'transparent',border:'none',color:'#2a4055',fontSize:'16px',padding:'2px 4px',lineHeight:'1'}});rem.textContent='−'
+      rem.addEventListener('click',()=>{
+        STATE.tags[folder()]=tags().filter(x=>x.id!==t.id)
+        saveToFirebase();renderTagList()
+      })
+      const pal=el('div',{style:{display:'none',flexWrap:'wrap',gap:'5px',marginTop:'7px',paddingBottom:'3px'}})
+      for(const c of PALETTE){
+        const d=el('button',{style:{width:'13px',height:'13px',border:'none',borderRadius:'50%',background:c,padding:'0',flexShrink:'0',outline:t.color===c?`2px solid ${c}`:'none',outlineOffset:'2px'}})
+        d.addEventListener('click',()=>{
+          const idx=tags().findIndex(x=>x.id===t.id)
+          if(idx>=0)STATE.tags[folder()][idx].color=c
+          saveToFirebase();renderTagList()
+        })
+        pal.appendChild(d)
+      }
+      row.appendChild(lbl);row.appendChild(sw);row.appendChild(rem)
+      block.appendChild(row);block.appendChild(pal)
+      tagList.appendChild(block)
+    }
+  }
+  renderTagList()
+
+  // new tag
+  const newWrap=el('div',{style:{borderTop:'1px solid #0f1924',paddingTop:'10px'}})
+  const newRow=el('div',{style:{display:'flex',gap:'7px',alignItems:'center'}})
+  const inp=el('input',{placeholder:'новый тег',style:{flex:'1',background:'transparent',border:'none',borderBottom:'1px solid #151f2e',outline:'none',color:'#7a9bb5',fontSize:'11px',fontWeight:'300',padding:'3px 0'}})
+  let newColor=PALETTE[4]
+  const colorSw=el('button',{style:{width:'9px',height:'9px',borderRadius:'50%',border:'none',background:newColor,padding:'0',flexShrink:'0',opacity:'0.8'}})
+  const addBtn=el('button',{style:{background:'transparent',border:'none',color:'#2a4055',fontSize:'16px',padding:'2px 4px',lineHeight:'1'}});addBtn.textContent='+'
+
+  let newPalOpen=false
+  const newPal=el('div',{style:{display:'none',flexWrap:'wrap',gap:'5px',marginTop:'7px'}})
+  for(const c of PALETTE){
+    const d=el('button',{style:{width:'13px',height:'13px',border:'none',borderRadius:'50%',background:c,padding:'0',flexShrink:'0',outline:newColor===c?`2px solid ${c}`:'none',outlineOffset:'2px'}})
+    d.addEventListener('click',()=>{
+      newColor=c;colorSw.style.background=c
+      newPal.querySelectorAll('button').forEach((b,i)=>b.style.outline=PALETTE[i]===c?`2px solid ${c}`:'none')
+      newPalOpen=false;newPal.style.display='none'
+    })
+    newPal.appendChild(d)
+  }
+  colorSw.addEventListener('click',()=>{newPalOpen=!newPalOpen;newPal.style.display=newPalOpen?'flex':'none'})
+
+  function addTag(){
+    const l=inp.value.trim().toUpperCase();if(!l)return
+    if(!STATE.tags[folder()])STATE.tags[folder()]=[]
+    STATE.tags[folder()].push({id:String(Date.now()),label:l,color:newColor})
+    saveToFirebase();inp.value='';renderTagList()
+  }
+  addBtn.addEventListener('click',addTag)
+  inp.addEventListener('keydown',e=>e.key==='Enter'&&addTag())
+
+  newRow.appendChild(inp);newRow.appendChild(colorSw);newRow.appendChild(addBtn)
+  newWrap.appendChild(newRow);newWrap.appendChild(newPal)
+
+  sb.appendChild(head);sb.appendChild(tagList);sb.appendChild(newWrap)
+  overlay.appendChild(sb)
+  overlay.addEventListener('click',e=>{if(e.target===overlay)closeSidebar()})
+  return overlay
+}
+
+function render(){
+  const root=document.getElementById('root')
+  root.innerHTML=''
+
+  // sidebar
+  if(sidebarOpen) root.appendChild(makeSidebar())
+
+  const wrap=el('div',{style:{flex:'1',maxWidth:'640px',width:'100%',margin:'0 auto',padding:'16px 16px 90px',boxSizing:'border-box'}})
+
+  // top bar
+  const topBar=el('div',{style:{display:'flex',gap:'8px',marginBottom:'14px',alignItems:'center'}})
+  const menuBtn=el('button',{style:{background:'transparent',border:'none',color:'#2a4055',fontSize:'17px',padding:'0 6px',lineHeight:'1'}});menuBtn.textContent='≡'
+  menuBtn.addEventListener('click',()=>{sidebarOpen=true;render()})
+  const inp=el('input',{style:{flex:'1',background:'transparent',border:'none',borderBottom:'1px solid #151f2e',outline:'none',color:'#7a9bb5',fontSize:'12px',fontWeight:'300',padding:'7px 2px'}})
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter'){addTask(inp.value);inp.value=''}})
+  topBar.appendChild(menuBtn);topBar.appendChild(inp)
+  wrap.appendChild(topBar)
+  setTimeout(()=>inp.focus(),0)
+
+  // tasks
+  const tgs=tags()
+  const pending=sortItems(tasks().filter(t=>!t.done),tgs)
+  const done=tasks().filter(t=>t.done)
+
+  const list=el('div',{style:{display:'flex',flexDirection:'column'}})
+  for(const task of pending){
+    const block=el('div',{style:{display:'flex',flexDirection:'column'}})
+    block.appendChild(makeTaskRow(task,tgs,false))
+    const subs=sortItems((task.subtasks||[]),tgs)
+    for(const s of subs.filter(x=>!x.done)) block.appendChild(makeSubRow({...s,taskId:task.id},tgs))
+    for(const s of subs.filter(x=>x.done)){const r=makeSubRow({...s,taskId:task.id},tgs);r.dataset.donesub='1';block.appendChild(r)}
+    list.appendChild(block)
+  }
+  wrap.appendChild(list)
+
+  if(done.length){
+    const div=el('div',{style:{height:'1px',background:'#0f1924',margin:'8px 0'}})
+    wrap.appendChild(div)
+    const doneList=el('div',{style:{display:'flex',flexDirection:'column'}})
+    for(const task of done){
+      const block=el('div',{style:{display:'flex',flexDirection:'column'}})
+      block.appendChild(makeTaskRow(task,tgs,true))
+      const subs=sortItems((task.subtasks||[]),tgs)
+      for(const s of subs) block.appendChild(makeSubRow({...s,taskId:task.id},tgs))
+      doneList.appendChild(block)
+    }
+    wrap.appendChild(doneList)
+    const clr=el('button',{style:{marginTop:'8px',background:'transparent',border:'none',color:'#1e3045',fontSize:'10px',padding:'3px 0',fontWeight:'300'}})
+    clr.textContent='сгрузить выполненное'
+    clr.addEventListener('click',clearDone)
+    wrap.appendChild(clr)
+  }
+
+  root.appendChild(wrap)
+
+  // folder bar
+  const fbar=el('div',{style:{position:'fixed',bottom:'0',left:'0',right:'0',background:'#0d1117',borderTop:'1px solid #0f1924'}})
+  const fbtn=el('button',{style:{width:'100%',background:'transparent',border:'none',padding:'12px 0',fontSize:'10px',fontWeight:'300',color:'#1e3045',letterSpacing:'0.14em'}})
+  fbtn.textContent=folder()
+  fbtn.addEventListener('click',()=>{folderIdx=(folderIdx+1)%FOLDERS.length;render()})
+  fbar.appendChild(fbtn)
+  root.appendChild(fbar)
+}
+
+// ── actions ───────────────────────────────────────────────────────────────────
+function addTask(raw){
+  raw=raw.trim();if(!raw)return
+  const tgs=tags()
+  if(!STATE.tasks[folder()])STATE.tasks[folder()]=[]
+  STATE.tasks[folder()].unshift({id:Date.now(),text:cook(raw,tgs),done:false,priority:false,subtasks:[]})
+  saveToFirebase();render()
+}
+function toggleTask(id){
+  STATE.tasks[folder()]=tasks().map(t=>t.id===id?{...t,done:!t.done}:t)
+  saveToFirebase();render()
+}
+function togglePrio(id){
+  STATE.tasks[folder()]=tasks().map(t=>t.id===id?{...t,priority:!t.priority}:t)
+  saveToFirebase();render()
+}
+function deleteTask(id){
+  STATE.tasks[folder()]=tasks().filter(t=>t.id!==id)
+  saveToFirebase();render()
+}
+function clearDone(){
+  STATE.tasks[folder()]=tasks().filter(t=>!t.done)
+  saveToFirebase();render()
+}
+function addSub(taskId,text){
+  STATE.tasks[folder()]=tasks().map(t=>t.id===taskId?{...t,subtasks:[...(t.subtasks||[]),{id:Date.now(),text,done:false}]}:t)
+  saveToFirebase();render()
+}
+function toggleSub(taskId,subId){
+  STATE.tasks[folder()]=tasks().map(t=>t.id===taskId?{...t,subtasks:(t.subtasks||[]).map(s=>s.id===subId?{...s,done:!s.done}:s)}:t)
+  saveToFirebase();render()
+}
+function deleteSub(taskId,subId){
+  STATE.tasks[folder()]=tasks().map(t=>t.id===taskId?{...t,subtasks:(t.subtasks||[]).filter(s=>s.id!==subId)}:t)
+  saveToFirebase();render()
+}
+function closeSidebar(){sidebarOpen=false;render()}
+
+// ── init ──────────────────────────────────────────────────────────────────────
+render()
+initFirebase().catch(console.error)
+</script>
+</body>
+</html>
